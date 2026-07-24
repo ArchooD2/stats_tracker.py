@@ -109,9 +109,15 @@ def edit():
     return exit_flag
 
 def get_config():
-    with open("config.json", "r") as f:
-        settings = json.load(f)
-        return settings
+    try:
+        with open("config.json", "r") as f:
+            return json.load(f)
+
+    except FileNotFoundError:
+        set_defaults()
+
+        with open("config.json", "r") as f:
+            return json.load(f)
     
 leagues = { "clover":       "6805db0cac48194de3cd3fe4", 
             "pineapple":    "6805db0cac48194de3cd3fe5", 
