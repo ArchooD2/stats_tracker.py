@@ -1,6 +1,7 @@
 import requests
 import json
 import os
+import tempfile
 import defense
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -14,6 +15,21 @@ from difflib import get_close_matches
 ALL_GAMES_PATH = "data/all_games.json"
 FETCH_WORKERS = min(16, (os.cpu_count() or 1) + 4)
 _thread_local = local()
+
+
+def write_json_atomic(path, payload, indent=2):
+    directory = os.path.dirname(path) or "."
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=directory,
+        delete=False,
+    ) as temp_file:
+        json.dump(payload, temp_file, indent=indent)
+        temp_file.flush()
+        os.fsync(temp_file.fileno())
+
+    os.replace(temp_file.name, path)
 
 
 def get_session():
@@ -107,9 +123,24 @@ def load_games():
     with open(ALL_GAMES_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
 
+
+def load_players_for_recording():
+    player_path = "data/player_data.json"
+
+    if not os.path.isfile(player_path):
+        return {}
+
+    try:
+        with open(player_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError as error:
+        tqdm.write(
+            f"player_data.json is malformed ({error}); rebuilding from scratch."
+        )
+        return {}
+
 def save_games(games):
-    with open(ALL_GAMES_PATH, "w", encoding="utf-8") as f:
-        json.dump(games, f, indent=2)
+    write_json_atomic(ALL_GAMES_PATH, games)
 
 def update_rosters():
     league_ids = [
@@ -246,12 +277,7 @@ def update_rosters():
         "leagues": league_dict,
     }
 
-    with open(
-        "data/roster_info.json",
-        "w",
-        encoding="utf-8",
-    ) as file:
-        json.dump(roster_info, file, indent=2)
+    write_json_atomic("data/roster_info.json", roster_info)
 
 # gather data you need to go to individual player IDs to obtain
 def update_rosters_deep():
@@ -323,22 +349,12 @@ def update_rosters_deep():
 
             # Checkpoint occasionally so a later failure does not lose
             # every successfully fetched player.
-            if processed_count % 100 == 0:
-                with open(
-                    roster_path,
-                    "w",
-                    encoding="utf-8",
-                ) as f:
-                    json.dump(roster_info, f, indent=2)
+            if processed_count % 1000 == 0:
+                write_json_atomic(roster_path, roster_info)
 
     progress.close()
 
-    with open(
-        roster_path,
-        "w",
-        encoding="utf-8",
-    ) as f:
-        json.dump(roster_info, f, indent=2)
+    write_json_atomic(roster_path, roster_info)
 
 # update the game list
 def update_games(s, hard_reset=False):
@@ -407,9 +423,8 @@ def record_games(toi=None, hard_reset=False):
     games = load_games()
     players = {}
 
-    if os.path.isfile("data/player_data.json") and not hard_reset:
-        with open("data/player_data.json", "r", encoding="utf-8") as f:
-            players = json.load(f)
+    if not hard_reset:
+        players = load_players_for_recording()
 
     games_to_record = [
         (game_id, game_info)
@@ -546,27 +561,17 @@ def record_games(toi=None, hard_reset=False):
 
             # Less frequent checkpoints avoid repeatedly rewriting large
             # JSON files while still limiting lost work after a crash.
-            if processed_count % 100 == 0:
+            if processed_count % 1000 == 0:
                 save_games(games)
 
-                with open(
-                    "data/player_data.json",
-                    "w",
-                    encoding="utf-8",
-                ) as f:
-                    json.dump(players, f)
+                write_json_atomic("data/player_data.json", players, indent=None)
 
     progress.close()
 
     # Save the final partial batch.
     save_games(games)
 
-    with open(
-        "data/player_data.json",
-        "w",
-        encoding="utf-8",
-    ) as f:
-        json.dump(players, f, indent=2)
+    write_json_atomic("data/player_data.json", players)
 
 # create a json that stores common human metrics for players
 def calculate_human_stats():
@@ -624,9 +629,7 @@ def calculate_human_stats():
         if good_shit["line_drive_fielded"] + good_shit["line_drive_allowed"] > 0:
             result["LDO%"] = good_shit["line_drive_fielded"] / (good_shit["line_drive_fielded"] + good_shit["line_drive_allowed"])
         full_result[p] = result
-    with open("data/processed_player_data.json", "w") as f:
-        json.dump(full_result, f, indent=2)
-        f.close()
+    write_json_atomic("data/processed_player_data.json", full_result)
 
 # calculate 100 thresholds for each calculated human stat and stores them in stat_barriers
 def calculate_percentiles():
@@ -664,8 +667,7 @@ def calculate_percentiles():
             results.append(everyone[int((len(everyone) * i / 100))])
         # print(results)
         barriers[stat] = results
-    with open("data/stat_barriers.json", "w") as f:
-        json.dump(barriers, f, indent=2)
+    write_json_atomic("data/stat_barriers.json", barriers)
 
 # return the ansi string that will color a piece of text in the console
 def color(stat, value):
