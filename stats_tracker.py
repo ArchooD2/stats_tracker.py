@@ -7,6 +7,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from threading import local
 import stats_config as config
+import stats_update
 from contextlib import chdir
 from tqdm import tqdm
 from difflib import get_close_matches
@@ -611,7 +612,10 @@ def calculate_human_stats():
         if good_shit["at_bats"] > 0:
             hits = good_shit["singles"] + good_shit["doubles"] + good_shit["triples"] + good_shit["home_runs"]
             result["AVG"] = hits / good_shit["at_bats"]
-            result["OBP"] = (hits + good_shit["walked"] + good_shit["hit_by_pitch"]) / (good_shit["at_bats"] + good_shit["walked"] + good_shit["hit_by_pitch"] + good_shit["sac_flies"])
+            obp_denominator = good_shit["plate_appearances"]
+            if obp_denominator <= 0:
+                obp_denominator = good_shit["at_bats"] + good_shit["walked"] + good_shit["hit_by_pitch"] + good_shit["sac_flies"]
+            result["OBP"] = (hits + good_shit["walked"] + good_shit["hit_by_pitch"]) / obp_denominator
             result["SLG"] = (good_shit["singles"] + 2 * good_shit["doubles"] + 3 * good_shit["triples"] + 4 * good_shit["home_runs"]) / good_shit["at_bats"]
             result["OPS"] = result["OBP"] + result["SLG"]
             result["K%"] = good_shit["struck_out"] / good_shit["plate_appearances"]
@@ -831,83 +835,79 @@ def search_program():
     prompt = " "
     while prompt.lower() not in ["1", "close", "exit", "cls"]:
         prompt = input("Look up team by ID or name: ")
-        flag = False
-        teams = roster_info["teams"]
-        matches = ""
-
-        # Direct team ID lookup
-        if prompt in teams:
-            flag = True
-
-        else:
-            normalized_prompt = prompt.strip().lower()
-
-            name_to_id = {
-                team_info["name"].lower(): team_id
-                for team_id, team_info in teams.items()
-            }
-
-            # Exact team-name lookup
-            if normalized_prompt in name_to_id:
-                prompt = name_to_id[normalized_prompt]
-                flag = True
-
-            else:
-                matches = get_close_matches(
-                    normalized_prompt,
-                    name_to_id,
-                    n=1,
-                    cutoff=0.6,
+        if prompt.lower() == "legend":
+            legend()
+        elif prompt[:11].lower() == "leaderboard":
+            prompt_parts = prompt.split(" ")
+            reverse = False
+            no_qualify = False
+            if len(prompt_parts) > 2:
+                arguments = prompt_parts[2:]
+                reverse = "reverse" in arguments
+                no_qualify = "all" in arguments
+            if len(prompt_parts) > 1:
+                leaderboard(
+                    prompt_parts[1].upper(),
+                    reverse=reverse,
+                    no_qualify=no_qualify,
                 )
+            prompt = "".join(prompt_parts)
+        elif prompt[:5].lower() == "debug":
+            prompt_parts = prompt.split(" ")
+            if len(prompt_parts) > 1:
+                with open("data/player_data.json", "r") as f:
+                    nitty_gritty = json.load(f)
+                    if prompt_parts[1] in nitty_gritty:
+                        print(numbers[prompt_parts[1]])
+                        print(dict(sorted(nitty_gritty[prompt_parts[1]].items())))
+                    else:
+                        print("player not found :(")
+            prompt = "" # this is to return it to a string that won't crash the program
+        elif prompt[:5].lower() == "pitch":
+            prompt_parts = prompt.split(" ")
+            if len(prompt_parts) > 1:
+                pitch_breakdown(prompt_parts[1])
+            prompt = ""
+        elif prompt.lower() == "config":
+            if config.edit():
+                print("as the league list has changed the program will now exit; please run again to begin adding new data")
+                print("yes this is kind of stupid. maybe azurite will change it later?")
+                os.remove(ALL_GAMES_PATH)
+                os.remove("data/player_data.json")
+                os.remove("data/processed_player_data.json")
+                os.remove("data/roster_info.json")
+                os.remove("data/stat_barriers.json")
+                return
+        else:
+            flag = False
+            teams = roster_info["teams"]
+            matches = []
 
-                
+            if prompt in teams:
+                flag = True
+            else:
+                normalized_prompt = prompt.strip().lower()
+                name_to_id = {
+                    team_info["name"].lower(): team_id
+                    for team_id, team_info in teams.items()
+                }
 
-        if flag:
-            print(f"{roster_info["teams"][prompt]["emoji"]} {roster_info["teams"][prompt]["name"]}")
-            for m in roster_info["teams"][prompt]["members"]:
-                print_overview(m, roster_info, numbers)
+                if normalized_prompt in name_to_id:
+                    prompt = name_to_id[normalized_prompt]
+                    flag = True
+                else:
+                    matches = get_close_matches(
+                        normalized_prompt,
+                        name_to_id,
+                        n=1,
+                        cutoff=0.6,
+                    )
 
-        if not flag:
-            if prompt.lower() == "legend":
-                legend()
-            elif prompt[:11].lower() == "leaderboard":
-                prompt = prompt.split(" ")
-                reverse = False
-                no_qualify = False
-                if len(prompt) > 2:
-                    arguments = prompt[2:]
-                    reverse = "reverse" in arguments
-                    no_qualify = "all" in arguments
-                if len(prompt) > 1:
-                    leaderboard(prompt[1].upper(), reverse=reverse, no_qualify=no_qualify)
-                prompt = "".join(prompt)
-            elif prompt[:5].lower() == "debug":
-                prompt = prompt.split(" ")
-                if len(prompt) > 1:
-                    with open("data/player_data.json", "r") as f:
-                        nitty_gritty = json.load(f)
-                        if prompt[1] in nitty_gritty:
-                            print(numbers[prompt[1]])
-                            print(dict(sorted(nitty_gritty[prompt[1]].items())))
-                        else:
-                            print("player not found :(")
-                prompt = "" # this is to return it to a string that won't crash the program
-            elif prompt[:5].lower() == "pitch":
-                prompt = prompt.split(" ")
-                if len(prompt) > 1:
-                    pitch_breakdown(prompt[1])
-                prompt = ""
-            elif prompt.lower() == "config":
-                if config.edit():
-                    print("as the league list has changed the program will now exit; please run again to begin adding new data")
-                    print("yes this is kind of stupid. maybe azurite will change it later?")
-                    os.remove(ALL_GAMES_PATH)
-                    os.remove("data/player_data.json")
-                    os.remove("data/processed_player_data.json")
-                    os.remove("data/roster_info.json")
-                    os.remove("data/stat_barriers.json")
-                    return
-            elif matches: # fuzzy search, now prioritized after leaderboards
+            if flag:
+                print(f"{roster_info["teams"][prompt]["emoji"]} {roster_info["teams"][prompt]["name"]}")
+                for m in roster_info["teams"][prompt]["members"]:
+                    print_overview(m, roster_info, numbers)
+            elif matches:
                 matched_name = matches[0]
                 prompt = name_to_id[matched_name]
 
@@ -915,13 +915,11 @@ def search_program():
                     f'No exact match. Using '
                     f'"{teams[prompt]["name"]}".'
                 )
-                
+
                 print(f"{roster_info["teams"][prompt]["emoji"]} {roster_info["teams"][prompt]["name"]}")
                 for m in roster_info["teams"][prompt]["members"]:
                     print_overview(m, roster_info, numbers)
-                
-                
-            elif prompt.lower() not in ["1", "close", "exit", "cls"]:
+            else:
                 print("team not found :(")
         print("")
 
@@ -1020,7 +1018,6 @@ def print_overview(playerID, roster_info, numbers, header="position"):
 
 with chdir(os.path.dirname(os.path.realpath(__file__))):
     current = requests.get("https://mmolb.com/api/seasons").json()["seasons"][0]["season_id"]
-    yesno = ""
 
     # data folder initialization
     if not os.path.exists(os.path.join('data')):
@@ -1031,27 +1028,7 @@ with chdir(os.path.dirname(os.path.realpath(__file__))):
     
     configuration = config.get_config()
 
-    # roster info initialization
-    if not os.path.isfile("data/roster_info.json"):
-        print("No roster information detected, automatically fetching info...")
-        update_rosters()
-        update_rosters_deep()
-    else:
-        yesno = input("Update players? (takes a while) (enter 'yes' to activate)\n")
-        if yesno.lower() in ["y", "yes"]:
-            update_rosters()
-        if yesno.lower() in ["d", "deep", "depth"]:
-            update_rosters()
-            update_rosters_deep()
-            
-    # games initialization
-    if configuration["auto_game_update"] == "on" or not os.path.isfile(ALL_GAMES_PATH) or input("Update games? (takes a while) (enter 'yes' to activate) (do this on your first run)\n").lower() in ["y", "yes"]:
-        print("Looking for new games...")
-        update_games(current)
-        with open("data/roster_info.json", "r") as f:
-            roster_info = json.load(f)
-            get_league_set = [i for i in roster_info["teams"].keys()]
-            record_games(toi=get_league_set)
+    stats_update.run_updates(current, configuration)
 
     get_pitch_zone_statistics()
     calculate_human_stats()
