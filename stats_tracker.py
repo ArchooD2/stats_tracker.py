@@ -1,5 +1,10 @@
 import requests
+import ast
+import csv
 import json
+import math
+import operator
+import shlex
 import os
 import tempfile
 import defense
@@ -574,6 +579,193 @@ def record_games(toi=None, hard_reset=False):
 
     write_json_atomic("data/player_data.json", players)
 
+
+ALLOWED_BINARY_OPERATORS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+}
+
+ALLOWED_UNARY_OPERATORS = {
+    ast.UAdd: operator.pos,
+    ast.USub: operator.neg,
+}
+
+ALLOWED_FUNCTIONS = {
+    "abs": abs,
+    "min": min,
+    "max": max,
+    "round": round,
+    "sqrt": math.sqrt,
+}
+
+
+def evaluate_formula(formula, values):
+    """Safely evaluate a custom stat formula against one player's stats."""
+    tree = ast.parse(formula, mode="eval")
+
+    def evaluate(node):
+        if isinstance(node, ast.Expression):
+            return evaluate(node.body)
+
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, (int, float)):
+                return node.value
+            raise ValueError("Only numeric constants are allowed")
+
+        if isinstance(node, ast.Name):
+            if node.id not in values:
+                raise KeyError(node.id)
+            return values[node.id]
+
+        if isinstance(node, ast.BinOp):
+            operation = ALLOWED_BINARY_OPERATORS.get(type(node.op))
+            if operation is None:
+                raise ValueError("Operator is not allowed")
+            return operation(evaluate(node.left), evaluate(node.right))
+
+        if isinstance(node, ast.UnaryOp):
+            operation = ALLOWED_UNARY_OPERATORS.get(type(node.op))
+            if operation is None:
+                raise ValueError("Unary operator is not allowed")
+            return operation(evaluate(node.operand))
+
+        if isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name):
+                raise ValueError("Only direct function calls are allowed")
+            function = ALLOWED_FUNCTIONS.get(node.func.id)
+            if function is None:
+                raise ValueError(f"Function {node.func.id!r} is not allowed")
+            if node.keywords:
+                raise ValueError("Keyword arguments are not allowed")
+            return function(*(evaluate(argument) for argument in node.args))
+
+        raise ValueError(f"Unsupported formula element: {type(node).__name__}")
+
+    result = evaluate(tree)
+
+    if not isinstance(result, (int, float)) or not math.isfinite(result):
+        raise ValueError("Formula did not produce a finite number")
+
+    return result
+
+
+def get_custom_stat_definitions():
+    custom_stats = config.get_config().get("custom_stats", {})
+    normalized = {}
+
+    for name, definition in custom_stats.items():
+        stat_name = name.upper()
+
+        if isinstance(definition, str):
+            definition = {"formula": definition}
+
+        if not isinstance(definition, dict) or "formula" not in definition:
+            tqdm.write(f"Ignoring invalid custom stat definition: {name}")
+            continue
+
+        normalized[stat_name] = {
+            "formula": definition["formula"],
+            "lower_is_better": bool(definition.get("lower_is_better", False)),
+            "qualification": definition.get("qualification", "batting").lower(),
+            "precision": int(definition.get("precision", 3)),
+        }
+
+    return normalized
+
+
+def add_custom_stats(raw_stats, calculated_stats):
+    custom_stats = get_custom_stat_definitions()
+    values = {**raw_stats, **calculated_stats}
+
+    # Multiple passes allow one custom stat to reference an earlier custom stat.
+    unresolved = dict(custom_stats)
+    for _ in range(len(unresolved) + 1):
+        made_progress = False
+
+        for name, definition in list(unresolved.items()):
+            try:
+                value = evaluate_formula(definition["formula"], values)
+            except (KeyError, ZeroDivisionError):
+                continue
+            except (SyntaxError, TypeError, ValueError) as error:
+                tqdm.write(f"Custom stat {name} is invalid: {error}")
+                del unresolved[name]
+                continue
+
+            calculated_stats[name] = value
+            values[name] = value
+            del unresolved[name]
+            made_progress = True
+
+        if not made_progress:
+            break
+
+    return calculated_stats
+
+
+def get_stat_metadata(stat):
+    stat = stat.upper()
+    custom = get_custom_stat_definitions().get(stat)
+
+    if custom:
+        return {
+            "lower_is_better": custom["lower_is_better"],
+            "qualification": custom["qualification"],
+            "precision": custom["precision"],
+        }
+
+    pitching_stats = {"ERA", "WHIP", "K/9", "BB/9", "H/9", "HR/9"}
+    lower_better_stats = {"ERA", "WHIP", "K%", "BB/9", "H/9", "HR/9"}
+    defense_stats = {"GBO%", "FBO%", "LDO%"}
+
+    qualification = "batting"
+    if stat in pitching_stats:
+        qualification = "pitching"
+    elif stat in defense_stats:
+        qualification = "defense"
+
+    return {
+        "lower_is_better": stat in lower_better_stats,
+        "qualification": qualification,
+        "precision": 3,
+    }
+
+
+def export_rows(rows, output_format, path):
+    output_format = output_format.lower()
+
+    if output_format not in {"csv", "json"}:
+        raise ValueError("Export format must be csv or json")
+
+    if not rows:
+        print("Nothing to export.")
+        return
+
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
+    if output_format == "csv":
+        fieldnames = []
+        for row in rows:
+            for key in row:
+                if key not in fieldnames:
+                    fieldnames.append(key)
+
+        with open(path, "w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+    else:
+        with open(path, "w", encoding="utf-8") as file:
+            json.dump(rows, file, indent=2, ensure_ascii=False)
+
+    print(f"Exported {len(rows)} row(s) to {path}")
+
+
 # create a json that stores common human metrics for players
 def calculate_human_stats():
     players = {}
@@ -632,6 +824,7 @@ def calculate_human_stats():
             result["FBO%"] = good_shit["fly_ball_fielded"] / (good_shit["fly_ball_fielded"] + good_shit["fly_ball_allowed"])
         if good_shit["line_drive_fielded"] + good_shit["line_drive_allowed"] > 0:
             result["LDO%"] = good_shit["line_drive_fielded"] / (good_shit["line_drive_fielded"] + good_shit["line_drive_allowed"])
+        result = add_custom_stats(players[p], result)
         full_result[p] = result
     write_json_atomic("data/processed_player_data.json", full_result)
 
@@ -650,13 +843,13 @@ def calculate_percentiles():
 
     at_bats, outs = thresholds()
 
-    for stat in ["AVG", "OBP", "SLG", "OPS", "ERA", "WHIP", "K%", "K/9", "BB/9", "H/9", "HR/9", "GBO%", "FBO%", "LDO%"]:
-        lower_better = False
-        pitching_stat = False
-        if stat in ["ERA", "WHIP", "K%", "BB/9", "H/9", "HR/9"]:
-            lower_better = True
-        if stat in ["ERA", "WHIP", "K/9", "BB/9", "H/9", "HR/9"]:
-            pitching_stat = True
+    stat_names = ["AVG", "OBP", "SLG", "OPS", "ERA", "WHIP", "K%", "K/9", "BB/9", "H/9", "HR/9", "GBO%", "FBO%", "LDO%"]
+    stat_names.extend(get_custom_stat_definitions())
+
+    for stat in dict.fromkeys(stat_names):
+        metadata = get_stat_metadata(stat)
+        lower_better = metadata["lower_is_better"]
+        pitching_stat = metadata["qualification"] == "pitching"
         numbers = {}
         if os.path.isfile("data/processed_player_data.json"):
             with open("data/processed_player_data.json", "r") as f:
@@ -666,21 +859,18 @@ def calculate_percentiles():
             if stat in numbers[i] and ((pitching_stat and players[i]["outs"] > outs) or ("at_bats" in players[i] and players[i]["at_bats"] > at_bats)) and i in rosters:
                 everyone.append(numbers[i][stat])
         everyone.sort(key=lambda x: x, reverse=lower_better)
+        if not everyone:
+            continue
         results = []
         for i in range(100):
-            results.append(everyone[int((len(everyone) * i / 100))])
+            results.append(everyone[min(int(len(everyone) * i / 100), len(everyone) - 1)])
         # print(results)
         barriers[stat] = results
     write_json_atomic("data/stat_barriers.json", barriers)
 
 # return the ansi string that will color a piece of text in the console
 def color(stat, value):
-    lower_better = False
-    pitching_stat = False
-    if stat in ["ERA", "WHIP", "K%", "BB/9", "H/9", "HR/9"]:
-        lower_better = True
-    if stat in ["ERA", "WHIP", "K/9", "BB/9", "H/9", "HR/9"]:
-        pitching_stat = True
+    lower_better = get_stat_metadata(stat)["lower_is_better"]
     
     barriers = []
     with open("data/stat_barriers.json", "r") as f:
@@ -736,70 +926,152 @@ def thresholds():
 # print the leaderboards for a specific stat (though it prints all relevant stats, it sorts by the specified one)
 # "reverse" argument makes it so the worst players show up
 # "no_qualify" removes the AB/out limit
-def leaderboard(stat, reverse=False, no_qualify=False, include_unknown_players=False):
+def build_leaderboard_rows(
+    stat,
+    reverse=False,
+    no_qualify=False,
+    include_unknown_players=False,
+    limit=20,
+):
     stat = stat.upper()
-    numbers = {}
-    if os.path.isfile("data/processed_player_data.json"):
-        with open("data/processed_player_data.json", "r") as f:
-            numbers = json.load(f)
-    qual_check = {}
-    if os.path.isfile("data/player_data.json"):
-        with open("data/player_data.json", "r") as f:
-            qual_check = json.load(f)
-    at_bats, outs = thresholds()
-    # if "all" is enabled, we no longer cared about the barriers
-    at_bats = 1 if no_qualify else at_bats
-    outs = 1 if no_qualify else outs
-    roster_info = {}
-    if os.path.isfile("data/roster_info.json"):
-        with open("data/roster_info.json", "r") as f:
-            roster_info = json.load(f)
-    registered_players = [_ for _ in roster_info["players"].keys()]
 
-    leaderboard = []
-    lower_better = False
-    pitching_stat = False
-    defense_stat = False
-    if stat in ["ERA", "WHIP", "K%", "BB/9", "H/9", "HR/9"]:
-        lower_better = True
-    if stat in ["ERA", "WHIP", "K/9", "BB/9", "H/9", "HR/9"]:
-        pitching_stat = True
-    if stat in ["GBO%", "LDO%", "FBO%"]:
-        defense_stat = True
-        print("NOTE: defense thresholds are currently a work in progress (current criteria is 20)")
-    if pitching_stat:
-        print("Required outs:", outs)
-    else:
-        print("Required ABs:", at_bats)
-    if stat not in ["ERA", "WHIP", "K/9", "AVG", "OBP", "SLG", "OPS", "K%", "BB/9", "H/9", "HR/9", "GBO%", "LDO%", "FBO%"]:
+    with open("data/processed_player_data.json", "r", encoding="utf-8") as f:
+        numbers = json.load(f)
+    with open("data/player_data.json", "r", encoding="utf-8") as f:
+        qual_check = json.load(f)
+    with open("data/roster_info.json", "r", encoding="utf-8") as f:
+        roster_info = json.load(f)
+
+    recognized_stats = set()
+    for player_stats in numbers.values():
+        recognized_stats.update(player_stats)
+
+    if stat not in recognized_stats:
         print(f"Stat {stat} not recognized")
-        return -1
+        return [], roster_info, numbers
 
-    for i in numbers:
-        if i in registered_players or include_unknown_players:
-            if pitching_stat:
-                if "outs" in qual_check[i] and qual_check[i]["outs"] > outs:
-                    leaderboard.append([i, numbers[i][stat]])
-            elif defense_stat:
-                
-                if "outs" not in qual_check[i] or qual_check[i]["outs"] < 3: # the "WE HATE PITCHERS" line that excludes pitchers from defense leaderboards
-                    defense = ["ground_ball_allowed", "ground_ball_fielded", "fly_ball_allowed", "fly_ball_fielded", "line_drive_allowed", "line_drive_fielded"]
-                    for d in range(len(defense)):
-                        defense[d] = qual_check[i][defense[d]] if defense[d] in qual_check[i] else 0
-                    if stat == "GBO%" and defense[0] + defense[1] > 20:
-                        leaderboard.append([i, numbers[i][stat]])
-                    if stat == "FBO%" and defense[2] + defense[3] > 20:
-                        leaderboard.append([i, numbers[i][stat]])
-                    if stat == "LDO%" and defense[4] + defense[5] > 20:
-                        leaderboard.append([i, numbers[i][stat]])
-            else:
-                if "at_bats" in qual_check[i] and qual_check[i]["at_bats"] > at_bats:
-                    leaderboard.append([i, numbers[i][stat]])
+    metadata = get_stat_metadata(stat)
+    qualification = metadata["qualification"]
+    lower_better = metadata["lower_is_better"]
+    at_bats, outs = thresholds()
 
-    leaderboard.sort(key=lambda x: x[1], reverse=reverse ^ (not lower_better))
+    if no_qualify:
+        at_bats = 1
+        outs = 1
 
-    for i in leaderboard[:20]:
-        print_overview(i[0], roster_info, numbers, header="emoji")
+    registered_players = set(roster_info["players"])
+    ranked = []
+
+    for player_id, player_stats in numbers.items():
+        if stat not in player_stats:
+            continue
+        if player_id not in registered_players and not include_unknown_players:
+            continue
+
+        raw = qual_check.get(player_id, {})
+        qualifies = False
+
+        if qualification == "pitching":
+            qualifies = raw.get("outs", 0) > outs
+        elif qualification == "defense":
+            if raw.get("outs", 0) < 3:
+                event_map = {
+                    "GBO%": ("ground_ball_allowed", "ground_ball_fielded"),
+                    "FBO%": ("fly_ball_allowed", "fly_ball_fielded"),
+                    "LDO%": ("line_drive_allowed", "line_drive_fielded"),
+                }
+                fields = event_map.get(stat)
+                if fields:
+                    qualifies = sum(raw.get(field, 0) for field in fields) > 20
+                else:
+                    # Custom defensive formulas use any 20 tracked fielding chances.
+                    defensive_fields = [
+                        "ground_ball_allowed", "ground_ball_fielded",
+                        "fly_ball_allowed", "fly_ball_fielded",
+                        "line_drive_allowed", "line_drive_fielded",
+                    ]
+                    qualifies = sum(raw.get(field, 0) for field in defensive_fields) > 20
+        else:
+            qualifies = raw.get("at_bats", 0) > at_bats
+
+        if qualifies:
+            ranked.append((player_id, player_stats[stat]))
+
+    ranked.sort(key=lambda item: item[1], reverse=reverse ^ (not lower_better))
+
+    rows = []
+    for rank, (player_id, value) in enumerate(ranked[:limit], start=1):
+        player = roster_info["players"].get(player_id, {})
+        team = roster_info["teams"].get(player.get("team"), {})
+        row = {
+            "rank": rank,
+            "player_id": player_id,
+            "name": player.get("name", player_id),
+            "position": player.get("position", ""),
+            "team_id": player.get("team", ""),
+            "team": team.get("name", ""),
+            "stat": stat,
+            "value": value,
+        }
+        rows.append(row)
+
+    return rows, roster_info, numbers
+
+
+def leaderboard(
+    stat,
+    reverse=False,
+    no_qualify=False,
+    include_unknown_players=False,
+    limit=20,
+    return_rows=False,
+):
+    stat = stat.upper()
+    metadata = get_stat_metadata(stat)
+    at_bats, outs = thresholds()
+
+    if metadata["qualification"] == "pitching":
+        print("Required outs:", 1 if no_qualify else outs)
+    elif metadata["qualification"] == "defense":
+        print("NOTE: defense thresholds are currently a work in progress")
+    else:
+        print("Required ABs:", 1 if no_qualify else at_bats)
+
+    rows, roster_info, numbers = build_leaderboard_rows(
+        stat,
+        reverse=reverse,
+        no_qualify=no_qualify,
+        include_unknown_players=include_unknown_players,
+        limit=limit,
+    )
+
+    if return_rows:
+        return rows
+
+    for row in rows:
+        print_overview(row["player_id"], roster_info, numbers, header="emoji")
+
+    return rows
+
+
+def build_team_export_rows(team_id, roster_info, numbers):
+    rows = []
+    team = roster_info["teams"][team_id]
+
+    for player_id in team["members"]:
+        player = roster_info["players"].get(player_id, {})
+        row = {
+            "player_id": player_id,
+            "name": player.get("name", player_id),
+            "position": player.get("position", ""),
+            "bench": player.get("bench", False),
+            "team_id": team_id,
+            "team": team["name"],
+        }
+        row.update(numbers.get(player_id, {}))
+        rows.append(row)
+
+    return rows
 
 # print the thresholds for the program to color stats in overviews
 def legend():
@@ -852,6 +1124,56 @@ def search_program():
                     no_qualify=no_qualify,
                 )
             prompt = "".join(prompt_parts)
+        elif prompt.lower().startswith("export "):
+            try:
+                prompt_parts = shlex.split(prompt)
+            except ValueError as error:
+                print(f"could not parse export command: {error}")
+                prompt = ""
+                continue
+
+            if len(prompt_parts) < 4:
+                print("usage: export leaderboard STAT csv|json [path]")
+                print('   or: export team "TEAM NAME" csv|json [path]')
+                prompt = ""
+                continue
+
+            export_type = prompt_parts[1].lower()
+            output_format = prompt_parts[3].lower()
+            explicit_path = prompt_parts[4] if len(prompt_parts) > 4 else None
+
+            if output_format not in {"csv", "json"}:
+                print("export format must be csv or json")
+                prompt = ""
+                continue
+
+            if export_type == "leaderboard":
+                stat = prompt_parts[2].upper()
+                rows = leaderboard(stat, return_rows=True)
+                path = explicit_path or f"exports/leaderboard_{stat.replace('/', '_')}.{output_format}"
+                export_rows(rows, output_format, path)
+            elif export_type == "team":
+                team_query = prompt_parts[2]
+                team_id = team_query if team_query in roster_info["teams"] else None
+
+                if team_id is None:
+                    normalized = team_query.lower()
+                    for candidate_id, team_info in roster_info["teams"].items():
+                        if team_info["name"].lower() == normalized:
+                            team_id = candidate_id
+                            break
+
+                if team_id is None:
+                    print("team not found :(")
+                else:
+                    rows = build_team_export_rows(team_id, roster_info, numbers)
+                    safe_name = roster_info["teams"][team_id]["name"].lower().replace(" ", "_")
+                    path = explicit_path or f"exports/{safe_name}.{output_format}"
+                    export_rows(rows, output_format, path)
+            else:
+                print("export type must be leaderboard or team")
+
+            prompt = ""
         elif prompt[:5].lower() == "debug":
             prompt_parts = prompt.split(" ")
             if len(prompt_parts) > 1:
