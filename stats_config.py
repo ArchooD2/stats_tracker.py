@@ -61,29 +61,40 @@ def league_edit():
 
     while cmd.lower() != "exit":
         leagues = valid_options()["leagues"]
-        counter = 0
-
-        for league_name in leagues:
-            counter += 1
-            dim = "" if league_name in settings["leagues"] else "\033[38;5;239m"
-            print(
-                f"{dim}{league_name:<12}\x1b[0m",
-                end="\n" if counter % 4 == 0 else " ",
-            )
-
+        league_names = list(leagues)
+    
+        rows = [
+            league_names[index:index + 4]
+            for index in range(0, len(league_names), 4)
+        ]
+    
+        for row in rows:
+            cells = []
+    
+            for league_name in row:
+                dim = (
+                    ""
+                    if league_name in settings["leagues"]
+                    else "\033[38;5;239m"
+                )
+                cells.append(f"{dim}{league_name:<12}\x1b[0m")
+    
+            print(" ".join(cells))
+    
         cmd = input(
             "\nenter a league's name to toggle it on/off, "
             "or 'exit' to leave this submenu: "
-        )
-
-        if cmd.lower() in leagues:
-            if cmd.lower() in settings["leagues"]:
-                settings["leagues"].remove(cmd.lower())
+        ).strip().lower()
+    
+        if cmd in leagues:
+            if cmd in settings["leagues"]:
+                settings["leagues"].remove(cmd)
             else:
-                settings["leagues"].append(cmd.lower())
-
-        if cmd.lower() != "exit":
-            print("\033[F\033[K" * 6, end="")
+                settings["leagues"].append(cmd)
+    
+        if cmd != "exit":
+            lines_to_clear = len(rows) + 2
+            print("\033[F\033[K" * lines_to_clear, end="")
 
     with open("config.json", "w", encoding="utf-8") as f:
         json.dump(settings, f, indent=2)
