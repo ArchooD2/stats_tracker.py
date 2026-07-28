@@ -1094,6 +1094,132 @@ def legend():
                 string += f"{f"\033[38;5;{i[1]}m{f"{barriers[j][i[0]]:.3f}":>6}\x1b[0m | ":<12}"
             print(f"\033[38;5;{i[1]}m{i[2]}\x1b[0m |", string)
 
+
+def print_player_candidates(
+    player_ids,
+    roster_info,
+    heading="Multiple players matched:",
+):
+    print(heading)
+
+    for player_id in player_ids:
+        player = roster_info["players"][player_id]
+        team = roster_info["teams"].get(player.get("team"), {})
+
+        print(
+            f"  {player['name']:<30} "
+            f"{player.get('position', ''):<3} "
+            f"{team.get('emoji', '')} {team.get('name', '')} "
+            f"[{player_id}]"
+        )
+
+
+def resolve_player(query, roster_info):
+    """
+    Resolve a player ID from an ID, exact name, partial name, or fuzzy name.
+
+    Returns the player ID, or None when no unique player can be selected.
+    """
+    query = query.strip()
+
+    if not query:
+        print("Enter a player name or ID.")
+        return None
+
+    players = roster_info["players"]
+
+    # Direct ID lookup.
+    if query in players:
+        return query
+
+    normalized_query = " ".join(query.lower().split())
+
+    name_to_ids = {}
+
+    for player_id, player in players.items():
+        normalized_name = " ".join(
+            player.get("name", "").lower().split()
+        )
+
+        name_to_ids.setdefault(normalized_name, []).append(player_id)
+
+    # Exact case-insensitive name lookup.
+    exact_matches = name_to_ids.get(normalized_query, [])
+
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+
+    if len(exact_matches) > 1:
+        print_player_candidates(exact_matches, roster_info)
+        return None
+
+    # Unique partial-name lookup.
+    partial_matches = [
+        player_id
+        for player_id, player in players.items()
+        if normalized_query in " ".join(
+            player.get("name", "").lower().split()
+        )
+    ]
+
+    if len(partial_matches) == 1:
+        return partial_matches[0]
+
+    if len(partial_matches) > 1:
+        print_player_candidates(partial_matches, roster_info)
+        return None
+
+    # Fuzzy lookup for misspellings.
+    fuzzy_names = get_close_matches(
+        normalized_query,
+        name_to_ids,
+        n=5,
+        cutoff=0.6,
+    )
+
+    fuzzy_matches = [
+        player_id
+        for name in fuzzy_names
+        for player_id in name_to_ids[name]
+    ]
+
+    if len(fuzzy_matches) == 1:
+        player_id = fuzzy_matches[0]
+
+        print(
+            f'No exact match. Using '
+            f'"{players[player_id]["name"]}".'
+        )
+
+        return player_id
+
+    if fuzzy_matches:
+        print_player_candidates(
+            fuzzy_matches,
+            roster_info,
+            heading="Player not found. Did you mean:",
+        )
+    else:
+        print("Player not found :(")
+
+    return None
+
+def print_player(player_id, roster_info, numbers):
+    """Print one player's team and statistical overview."""
+    player = roster_info["players"][player_id]
+    team = roster_info["teams"].get(player.get("team"), {})
+
+    print(
+        f"\n{team.get('emoji', '')} "
+        f"{team.get('name', 'Unknown team')}"
+    )
+
+    print_overview(
+        player_id,
+        roster_info,
+        numbers,
+    )
+
 # console
 def search_program():
     numbers = {}
@@ -1174,21 +1300,75 @@ def search_program():
                 print("export type must be leaderboard or team")
 
             prompt = ""
-        elif prompt[:5].lower() == "debug":
-            prompt_parts = prompt.split(" ")
-            if len(prompt_parts) > 1:
-                with open("data/player_data.json", "r") as f:
+        elif prompt.lower() == "player":
+            print("usage: player PLAYER NAME OR ID")
+            prompt = ""
+
+        elif prompt.lower().startswith("player "):
+            player_query = prompt.partition(" ")[2].strip()
+
+            player_id = resolve_player(
+                player_query,
+                roster_info,
+            )
+
+            if player_id is not None:
+                print_player(
+                    player_id,
+                    roster_info,
+                    numbers,
+                )
+
+            prompt = ""
+        
+        elif prompt.lower() == "debug":
+            print("usage: debug PLAYER NAME OR ID")
+            prompt = ""
+
+        elif prompt.lower().startswith("debug "):
+            player_query = prompt.partition(" ")[2].strip()
+
+            player_id = resolve_player(
+                player_query,
+                roster_info,
+            )
+
+            if player_id is not None:
+                with open(
+                    "data/player_data.json",
+                    "r",
+                    encoding="utf-8",
+                ) as f:
                     nitty_gritty = json.load(f)
-                    if prompt_parts[1] in nitty_gritty:
-                        print(numbers[prompt_parts[1]])
-                        print(dict(sorted(nitty_gritty[prompt_parts[1]].items())))
-                    else:
-                        print("player not found :(")
-            prompt = "" # this is to return it to a string that won't crash the program
-        elif prompt[:5].lower() == "pitch":
-            prompt_parts = prompt.split(" ")
-            if len(prompt_parts) > 1:
-                pitch_breakdown(prompt_parts[1])
+
+                if player_id not in nitty_gritty:
+                    print("No recorded stats for that player.")
+                else:
+                    print(numbers.get(player_id, {}))
+                    print(
+                        dict(
+                            sorted(
+                                nitty_gritty[player_id].items()
+                            )
+                        )
+                    )
+
+            prompt = ""
+        elif prompt.lower() == "pitch":
+            print("usage: pitch PLAYER NAME OR ID")
+            prompt = ""
+
+        elif prompt.lower().startswith("pitch "):
+            player_query = prompt.partition(" ")[2].strip()
+
+            player_id = resolve_player(
+                player_query,
+                roster_info,
+            )
+
+            if player_id is not None:
+                pitch_breakdown(player_id)
+
             prompt = ""
         elif prompt.lower() == "config":
             if config.edit():
@@ -1245,47 +1425,116 @@ def search_program():
                 print("team not found :(")
         print("")
 
-def pitch_breakdown(playerID):
-    with open("data/player_data.json", "r") as f, open("data/roster_info.json", "r") as f2:
-        nitty_gritty = json.load(f)
-        roster_info = json.load(f2)
-        global_dist = get_pitch_zone_statistics()
-        if "pitch_data" in nitty_gritty[playerID]:
-            print(roster_info["players"][playerID]["name"], "-", f"{roster_info["teams"][roster_info["players"][playerID]["team"]]["emoji"]} {f"{roster_info["teams"][roster_info["players"][playerID]["team"]]["name"]}"}")
-            for i in nitty_gritty[playerID]["pitch_data"]:
-                grid = [[11, 0, 0, 0, 12, 0, -11, 0, 0, 0, -12],
-                        [0, 1, 2, 3, 0, 0, 0, -1, -2, -3, 0],
-                        [0, 4, 5, 6, 0, 0, 0, -4, -5, -6, 0],
-                        [0, 7, 8, 9, 0, 0, 0, -7, -8, -9, 0],
-                        [13, 0, 0, 0, 14, 0, -13, 0, 0, 0, -14]]
-                print(i, "distribution")
-                data = nitty_gritty[playerID]["pitch_data"][i] # this is here to make the code not hyroglyphic
-                personal = {}
-                everyone = {}
-                for j in data.keys():
-                    pitch_type = " ".join([roster_info["players"][playerID]["throws"], i])
-                    personal[j] = 100 * data[str(j)] / sum([data[l] for l in data.keys()]) # load % of distribution for this player only
-                    everyone[j] = 100 * global_dist[pitch_type][str(j)] / sum([global_dist[pitch_type][l] for l in global_dist[pitch_type].keys()]) # load % of distribution for everyone
-                for j in grid:
-                    to_print = ""
-                    for k in j:
-                        if k == 0:
-                            to_print += f"{"":>5}"
-                        if k > 0:
-                            to_print += f"\033[38;5;77m" if personal[str(k)] > everyone[str(k)] else f"\033[38;5;161m"
-                            if str(k) not in data.keys():
-                                to_print += f"{"0.0":>5}"
-                            else:
-                                to_print += f"{f"{personal[str(k)]:.1f}":>5}"
-                            to_print += "\x1b[0m"
-                        if k < 0:
-                            # print(pitch_type)
-                            if str(k * -1) not in global_dist[" ".join([roster_info["players"][playerID]["throws"], i])].keys():
-                                to_print += f"{"0.0":>5}"
-                            else:
-                                # print("hi2")
-                                to_print += f"{f"{everyone[str(k * -1)]:.1f}":>5}"
-                    print(to_print)
+def pitch_breakdown(player_id):
+    with open(
+        "data/player_data.json",
+        "r",
+        encoding="utf-8",
+    ) as player_file, open(
+        "data/roster_info.json",
+        "r",
+        encoding="utf-8",
+    ) as roster_file:
+        nitty_gritty = json.load(player_file)
+        roster_info = json.load(roster_file)
+
+    if player_id not in nitty_gritty:
+        print("No recorded data for that player.")
+        return
+
+    if "pitch_data" not in nitty_gritty[player_id]:
+        print("No pitch-location data for that player.")
+        return
+
+    player = roster_info["players"].get(player_id)
+
+    if player is None:
+        print("Player is not present in the current roster data.")
+        return
+
+    throws = player.get("throws")
+
+    if not throws:
+        print(
+            "Pitch zone statistics require a deep roster update. "
+            "Enter 'd' or 'deep' on the roster update screen."
+        )
+        return
+
+    global_dist = get_pitch_zone_statistics()
+
+    team = roster_info["teams"].get(player.get("team"), {})
+
+    print(
+        f"{player['name']} - "
+        f"{team.get('emoji', '')} {team.get('name', 'Unknown team')}"
+    )
+
+    grid = [
+        [11, 0, 0, 0, 12, 0, -11, 0, 0, 0, -12],
+        [0, 1, 2, 3, 0, 0, 0, -1, -2, -3, 0],
+        [0, 4, 5, 6, 0, 0, 0, -4, -5, -6, 0],
+        [0, 7, 8, 9, 0, 0, 0, -7, -8, -9, 0],
+        [13, 0, 0, 0, 14, 0, -13, 0, 0, 0, -14],
+    ]
+
+    for pitch_name, data in nitty_gritty[player_id]["pitch_data"].items():
+        pitch_type = f"{throws} {pitch_name}"
+
+        if pitch_type not in global_dist:
+            print(
+                f"\n{pitch_name} distribution unavailable: "
+                "no league-wide comparison data."
+            )
+            continue
+
+        personal_total = sum(data.values())
+        global_total = sum(global_dist[pitch_type].values())
+
+        if personal_total == 0 or global_total == 0:
+            continue
+
+        personal = {
+            zone: 100 * count / personal_total
+            for zone, count in data.items()
+        }
+
+        everyone = {
+            zone: 100 * count / global_total
+            for zone, count in global_dist[pitch_type].items()
+        }
+
+        print(f"\n{pitch_name} distribution")
+
+        for row in grid:
+            to_print = ""
+
+            for zone in row:
+                if zone == 0:
+                    to_print += f"{'':>5}"
+                    continue
+
+                if zone > 0:
+                    personal_value = personal.get(str(zone), 0.0)
+                    global_value = everyone.get(str(zone), 0.0)
+
+                    color_code = (
+                        "\033[38;5;77m"
+                        if personal_value > global_value
+                        else "\033[38;5;161m"
+                    )
+
+                    to_print += (
+                        f"{color_code}"
+                        f"{personal_value:>5.1f}"
+                        f"\x1b[0m"
+                    )
+
+                else:
+                    global_value = everyone.get(str(-zone), 0.0)
+                    to_print += f"{global_value:>5.1f}"
+
+            print(to_print)
 
 def get_pitch_zone_statistics():
     with open("data/player_data.json", "r") as f, open("data/roster_info.json", "r") as f2:
